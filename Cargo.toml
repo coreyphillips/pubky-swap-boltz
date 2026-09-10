@@ -10,30 +10,54 @@ repository = "https://github.com/coreyphillips/pubky-swap-boltz"
 [[bin]]
 name = "pubky-swap-boltz-proxy"
 path = "src/main.rs"
+required-features = ["server"]
+
+[[example]]
+name = "fixture_server"
+required-features = ["server"]
+
+[[test]]
+name = "bridge"
+required-features = ["server"]
+
+[[test]]
+name = "websocket"
+required-features = ["server"]
+
+[features]
+default = ["server"]
+server = ["dep:anyhow", "dep:axum", "dep:clap", "dep:futures-util", "dep:swap-config", "dep:toml", "dep:tracing-subscriber"]
+rendezvous = ["pubky-transport/iroh"]
+mobile = ["rendezvous", "dep:jni", "dep:rustls-platform-verifier"]
 
 [dependencies]
-anyhow = "1"
+anyhow = { version = "1", optional = true }
 async-trait = "0.1"
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"], optional = true }
 bitcoin = { version = "0.32", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-electrum-client = "0.24"
-futures-util = "0.3"
+clap = { version = "4", features = ["derive"], optional = true }
+electrum-client = { version = "0.24", default-features = false, features = ["proxy", "use-rustls-ring"] }
+futures-util = { version = "0.3", optional = true }
 fs2 = "0.4"
 hex = "0.4"
 lightning-invoice = { version = "0.33", features = ["std"] }
-pubky-transport = { git = "https://github.com/coreyphillips/pubky-swap", rev = "3b134ec48496d6f02bd43bd7b778d28a1992a630" }
+pubky-transport = { git = "https://github.com/coreyphillips/pubky-swap", rev = "0867de2ce94b8a2932a64372de4cd14aaa70040d" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-swap-common = { git = "https://github.com/coreyphillips/pubky-swap", rev = "3b134ec48496d6f02bd43bd7b778d28a1992a630" }
-swap-config = { git = "https://github.com/coreyphillips/pubky-swap", rev = "3b134ec48496d6f02bd43bd7b778d28a1992a630" }
+swap-common = { git = "https://github.com/coreyphillips/pubky-swap", rev = "0867de2ce94b8a2932a64372de4cd14aaa70040d" }
+swap-config = { git = "https://github.com/coreyphillips/pubky-swap", rev = "0867de2ce94b8a2932a64372de4cd14aaa70040d", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-toml = "0.8"
+toml = { version = "0.8", optional = true }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22.4", default-features = false, optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
 
 [dev-dependencies]
 http-body-util = "0.1"

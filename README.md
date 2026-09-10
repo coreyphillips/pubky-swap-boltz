@@ -75,3 +75,15 @@ See [protocol and endpoint notes](docs/operations.md) for the exact lifecycle ma
 ## License
 
 MIT.
+
+## Embedded mobile use
+
+Depend on this crate with `default-features = false` and `features = ["mobile"]` to use the library without the HTTP server or CLI. Build a `PubkyProvider::from_secret_key(secret, provider, timeout)`, `ElectrumChain`, identity-bound `Store`, and `Bridge` in the host application. The host supplies its existing 32-byte Pubky Ed25519 secret and must already have registered that identity with a homeserver. The bridge does not create an account or store that secret.
+
+Provider handles initialize without network access. The first provider request signs in on the inbox runtime, and subsequent failures allow a fresh sign-in. Each request renews the authenticated iroh rendezvous so provider restarts or idle peer eviction do not strand a returning client. Dropping the provider handle releases its inbox after outstanding requests finish or expire.
+
+Use `canonical_pubky` before binding persistent state to a provider. It accepts a bare z32 identity, `pubkyKEY`, `pubky:KEY`, `pubky://KEY`, or `pk:KEY`, with surrounding whitespace and a trailing slash. Resource paths and unrelated schemes are rejected. `identity_from_secret` derives the public identity without importing SDK-specific key types.
+
+`Bridge::spend_info` reads the accepted contract from durable state and independently observes its unspent funding output, without contacting the provider. It returns the actual output value, outpoint, confirmations, required confirmations, current height, and timeout. The caller retains its signing keys and preimages, checks the claim or refund safety window immediately before signing, and constructs the transaction. Expired invoices do not prevent recovery of an existing lockup. For submarine refunds, `Bridge::refund_info` returns every independently verified unspent output of that exact contract, including underpayments, excess payments, and multiple funding outputs. The caller can sweep them together after timeout.
+
+Android hosts must initialize both networking contexts before requests: `initialize_android_verifier` with the current JNI environment and application context, then `install_android_jni_context` with process-lifetime JVM and application global-reference pointers. Bundle the matching Java helper from `rustls-platform-verifier-android` and preserve `org.rustls.platformverifier.**` through code shrinking. The verifier helper and DNS context are separate requirements.

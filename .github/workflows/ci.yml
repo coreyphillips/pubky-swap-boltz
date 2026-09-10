@@ -29,6 +29,10 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Rust tests
         run: cargo test --all-targets --locked
+      - name: Embedded mobile library
+        run: |
+          cargo clippy --no-default-features --features mobile --all-targets --locked -- -D warnings
+          cargo test --no-default-features --features mobile --lib --locked
       - name: Official reference vectors
         working-directory: tests/conformance
         run: |

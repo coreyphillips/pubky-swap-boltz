@@ -2,9 +2,13 @@
 
 use crate::{model::TransactionInfo, Error, Result};
 use async_trait::async_trait;
-use bitcoin::{consensus::encode, Address, Network, OutPoint, ScriptBuf, Transaction, Txid};
+use bitcoin::{consensus::encode, Address, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use electrum_client::{Client, ConfigBuilder, ElectrumApi};
-use std::{str::FromStr, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    str::FromStr,
+    sync::Arc,
+};
 use swap_common::messages::SwapAccept;
 
 #[derive(Clone)]
@@ -21,6 +25,10 @@ pub trait Chain: Send + Sync {
     async fn tip(&self) -> Result<u32>;
     async fn fee(&self) -> Result<u64>;
     async fn observe(&self, accept: &SwapAccept) -> Result<Option<Observation>>;
+    /// Find all unspent outputs of the accepted script, including incorrect funding amounts.
+    async fn refund_utxos(&self, _accept: &SwapAccept) -> Result<Vec<(OutPoint, TxOut)>> {
+        Err(Error::Unsupported)
+    }
     async fn transaction(&self, txid: Txid) -> Result<TransactionInfo>;
     async fn broadcast(&self, transaction: Transaction) -> Result<Txid>;
 }
@@ -90,6 +98,16 @@ impl Chain for ElectrumChain {
         blocking(move || observe(&client, &script, value)).await
     }
 
+    async fn refund_utxos(&self, accept: &SwapAccept) -> Result<Vec<(OutPoint, TxOut)>> {
+        let script = Address::from_str(&accept.htlc_address)
+            .map_err(|_| Error::Validation)?
+            .require_network(self.network)
+            .map_err(|_| Error::Validation)?
+            .script_pubkey();
+        let client = self.client.clone();
+        blocking(move || refundable_outputs(&script, &script_history(&client, &script)?)).await
+    }
+
     async fn transaction(&self, txid: Txid) -> Result<TransactionInfo> {
         let client = self.client.clone();
         blocking(move || {
@@ -119,10 +137,13 @@ fn observe(client: &Client, script: &ScriptBuf, value: u64) -> Result<Option<Obs
         .map_err(|_| Error::Chain)?
         .height;
     let tip = u32::try_from(tip).map_err(|_| Error::Chain)?;
-    let history = client
+    classify_history(script, value, tip, &script_history(client, script)?)
+}
+
+fn script_history(client: &Client, script: &ScriptBuf) -> Result<Vec<(Transaction, i32)>> {
+    client
         .script_get_history(script)
-        .map_err(|_| Error::Chain)?;
-    let transactions = history
+        .map_err(|_| Error::Chain)?
         .into_iter()
         .map(|entry| {
             let transaction = client
@@ -133,8 +154,33 @@ fn observe(client: &Client, script: &ScriptBuf, value: u64) -> Result<Option<Obs
             }
             Ok((transaction, entry.height))
         })
-        .collect::<Result<Vec<_>>>()?;
-    classify_history(script, value, tip, &transactions)
+        .collect()
+}
+
+fn refundable_outputs(
+    script: &ScriptBuf,
+    history: &[(Transaction, i32)],
+) -> Result<Vec<(OutPoint, TxOut)>> {
+    let mut transactions = HashSet::new();
+    let mut candidates = BTreeMap::new();
+    let mut spent = HashSet::new();
+    for (transaction, _) in history {
+        let txid = transaction.compute_txid();
+        if !transactions.insert(txid) {
+            return Err(Error::Validation);
+        }
+        for (index, output) in transaction.output.iter().enumerate() {
+            if output.script_pubkey == *script {
+                let index = u32::try_from(index).map_err(|_| Error::Validation)?;
+                candidates.insert(OutPoint::new(txid, index), output.clone());
+            }
+        }
+        spent.extend(transaction.input.iter().map(|input| input.previous_output));
+    }
+    Ok(candidates
+        .into_iter()
+        .filter(|(outpoint, _)| !spent.contains(outpoint))
+        .collect())
 }
 
 fn classify_history(

@@ -114,6 +114,55 @@ pub(crate) fn accept(
     policy: &ClientPolicy,
     network: Network,
 ) -> Result<()> {
+    accept_at(record, accept, tip, policy, network, now())
+}
+
+/// Check saved terms without imposing a new negotiation window on funds already locked.
+pub(crate) fn persisted_accept(
+    record: &StoredSwap,
+    policy: &ClientPolicy,
+    network: Network,
+) -> Result<()> {
+    let accept = record.accept.as_ref().ok_or(Error::NotFound)?;
+    let tip = record.admission_tip.ok_or(Error::Validation)?;
+    let mut original = record.request.clone();
+    if request(&mut original, network)? != record.payment_hash
+        || original.direction() != accept.direction
+    {
+        return Err(Error::Validation);
+    }
+    let quote = record.quote.as_ref().ok_or(Error::Validation)?;
+    let amount_matches = match &original {
+        CreateRequest::Submarine(request) => {
+            invoice(&request.invoice, network)?.amount_milli_satoshis()
+                == quote.amount_sat.checked_mul(1000)
+        }
+        CreateRequest::Reverse(request) if request.onchain_amount > 0 => {
+            request.onchain_amount == quote.amount_sat
+        }
+        CreateRequest::Reverse(request) => request.invoice_amount == quote.total_sat,
+    };
+    if !amount_matches || quote.amount_sat.checked_add(quote.fee_sat) != Some(quote.total_sat) {
+        return Err(Error::Validation);
+    }
+    // Invoice lifetime was checked at admission. Recheck its original lifetime and immutable
+    // payment terms, allowing recovery after that invoice or the HTLC timeout has expired.
+    let invoice_time = if let Some(encoded) = &accept.invoice {
+        invoice(encoded, network)?.duration_since_epoch().as_secs()
+    } else {
+        0
+    };
+    accept_at(record, accept, tip, policy, network, invoice_time)
+}
+
+fn accept_at(
+    record: &StoredSwap,
+    accept: &SwapAccept,
+    tip: u32,
+    policy: &ClientPolicy,
+    network: Network,
+    invoice_time: u64,
+) -> Result<()> {
     let quote = record.quote.as_ref().ok_or(Error::Validation)?;
     let admission_tip = record.admission_tip.ok_or(Error::Validation)?;
     swap_common::validate::validate_accept(accept, quote, Some(admission_tip), policy)
@@ -171,7 +220,7 @@ pub(crate) fn accept(
             amount_is_explicit: true,
             expires_at_unix: invoice.expires_at().ok_or(Error::Validation)?.as_secs(),
         };
-        swap_common::validate::validate_hold_invoice(&decoded, quote, &hash, now(), policy)
+        swap_common::validate::validate_hold_invoice(&decoded, quote, &hash, invoice_time, policy)
             .map_err(|_| Error::Validation)?;
     } else if accept.invoice.is_some() {
         return Err(Error::Validation);

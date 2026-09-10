@@ -132,3 +132,22 @@ impl SwapUpdate {
         )
     }
 }
+
+/// Independently observed funding data for a caller-owned claim or refund signer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpendInfo {
+    pub outpoint: bitcoin::OutPoint,
+    pub output: bitcoin::TxOut,
+    pub confirmations: u32,
+    pub required_confirmations: u32,
+    pub tip: u32,
+    pub timeout_block_height: u32,
+}
+
+/// All independently observed outputs the client can refund from its submarine contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefundInfo {
+    pub utxos: Vec<(bitcoin::OutPoint, bitcoin::TxOut)>,
+    pub tip: u32,
+    pub timeout_block_height: u32,
+}

@@ -1,0 +1,13 @@
+{
+  "name": "pubky-swap-boltz-conformance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:vectors": "node vectors.mjs"
+  },
+  "devDependencies": {
+    "boltz-core": "5.0.0",
+    "@noble/curves": "2.4.0",
+    "@scure/btc-signer": "2.4.1"
+  }
+}

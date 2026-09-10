@@ -1,0 +1,42 @@
+[package]
+name = "pubky-swap-boltz"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Corey Phillips"]
+description = "A local Bitcoin swap compatibility bridge between Boltz clients and Pubky Swap"
+repository = "https://github.com/coreyphillips/pubky-swap-boltz"
+
+[[bin]]
+name = "pubky-swap-boltz-proxy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+bitcoin = { version = "0.32", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+electrum-client = "0.24"
+futures-util = "0.3"
+fs2 = "0.4"
+hex = "0.4"
+lightning-invoice = { version = "0.33", features = ["std"] }
+pubky-transport = { git = "https://github.com/coreyphillips/pubky-swap", rev = "3b134ec48496d6f02bd43bd7b778d28a1992a630" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+swap-common = { git = "https://github.com/coreyphillips/pubky-swap", rev = "3b134ec48496d6f02bd43bd7b778d28a1992a630" }
+swap-config = { git = "https://github.com/coreyphillips/pubky-swap", rev = "3b134ec48496d6f02bd43bd7b778d28a1992a630" }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.26"

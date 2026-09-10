@@ -1,0 +1,18 @@
+# Copy to config.toml and fill in an existing Pubky identity and compatible provider.
+bind = "127.0.0.1:9001"
+network = "regtest"
+provider = "REPLACE_WITH_PROVIDER_PUBKY"
+recovery_file = "/absolute/path/to/identity.recovery"
+data_dir = "./data"
+electrum_url = "tcp://127.0.0.1:60001"
+request_timeout_seconds = 60
+poll_seconds = 5
+max_fee_bps = 1000
+max_amount_sat = 1000000
+
+[passphrase]
+file = "/absolute/path/to/passphrase.secret"
+
+# Alternatively omit recovery_file and configure recovery_phrase.file.
+# [recovery_phrase]
+# file = "/absolute/path/to/phrase.secret"

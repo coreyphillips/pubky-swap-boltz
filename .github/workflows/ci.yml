@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.2'
+          cache-dependency-path: tests/conformance/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: tests/conformance/package-lock.json
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Rust tests
+        run: cargo test --all-targets --locked
+      - name: Official reference vectors
+        working-directory: tests/conformance
+        run: |
+          npm ci --ignore-scripts
+          npm run test:vectors
+      - name: Official SDK against proxy
+        run: |
+          set -euo pipefail
+          cargo build --locked --example fixture_server
+          ./target/debug/examples/fixture_server 127.0.0.1:19001 > /tmp/proxy-fixture.log 2>&1 &
+          fixture_pid=$!
+          trap 'kill "$fixture_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:19001/v2/version > /dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:19001/v2/version > /dev/null
+          cd tests/conformance
+          PUBKY_BOLTZ_TEST_URL=http://127.0.0.1:19001 go test -count=1 -v ./...

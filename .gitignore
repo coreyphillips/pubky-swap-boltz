@@ -1,0 +1,8 @@
+/target/
+/data/
+/config.toml
+*.sqlite3*
+*.recovery
+*.secret
+.DS_Store
+/tests/conformance/node_modules/

@@ -13,6 +13,11 @@ use std::{
 };
 use uuid::Uuid;
 
+mod snapshot;
+pub use snapshot::{
+    IdempotencyBinding, SnapshotSwap, StoreSnapshot, MAX_SNAPSHOT_BYTES, SNAPSHOT_VERSION,
+};
+
 pub struct Store {
     connection: Mutex<Connection>,
     _process_lock: Option<File>,

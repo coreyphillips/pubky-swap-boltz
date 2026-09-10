@@ -153,3 +153,43 @@ fn unconfirmed_funding_has_zero_confirmations() {
     let observation = observe_history(&[(funding(VALUE), -1)]).unwrap().unwrap();
     assert_eq!(observation.confirmations, 0);
 }
+
+#[test]
+fn refund_sweeps_incorrect_amounts_and_multiple_outputs() {
+    let mut underpayment = funding(500);
+    underpayment.output.push(TxOut {
+        value: Amount::from_sat(250_000),
+        script_pubkey: contract_script(),
+    });
+    let excess = funding(1_000_000);
+    let actual =
+        refundable_outputs(&contract_script(), &[(underpayment, 99), (excess, 0)]).unwrap();
+    assert_eq!(actual.len(), 3);
+    assert_eq!(
+        actual
+            .iter()
+            .map(|(_, output)| output.value.to_sat())
+            .sum::<u64>(),
+        1_250_500
+    );
+}
+
+#[test]
+fn refund_excludes_confirmed_and_mempool_spent_outputs() {
+    for height in [0, 100] {
+        let lockup = funding(500);
+        let spend = spending(&lockup, 0);
+        let actual =
+            refundable_outputs(&contract_script(), &[(lockup, 90), (spend, height)]).unwrap();
+        assert!(actual.is_empty());
+    }
+}
+
+#[test]
+fn refund_rejects_duplicate_history_entries() {
+    let lockup = funding(500);
+    assert!(matches!(
+        refundable_outputs(&contract_script(), &[(lockup.clone(), 90), (lockup, 90)]),
+        Err(Error::Validation)
+    ));
+}

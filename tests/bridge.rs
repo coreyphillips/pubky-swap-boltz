@@ -390,3 +390,349 @@ async fn discovery_honors_the_local_total_amount_ceiling() {
     assert!(bridge.create(boundary, None).await.is_ok());
     assert!(bridge.create(request(9), None).await.is_err());
 }
+
+struct RecoveryProvider;
+
+#[async_trait]
+impl Provider for RecoveryProvider {
+    fn identity(&self) -> String {
+        "fixture-client".into()
+    }
+    fn provider_key(&self) -> String {
+        "fixture-provider".into()
+    }
+    async fn offer(&self) -> Result<SwapOffer> {
+        panic!("recovery contacted provider")
+    }
+    async fn quote(&self, _: QuoteRequest) -> Result<Quote> {
+        panic!("recovery contacted provider")
+    }
+    async fn create(&self, _: SwapRequest) -> Result<SwapAccept> {
+        panic!("recovery contacted provider")
+    }
+    async fn snapshot(&self, _: Uuid) -> Result<SwapStatusSnapshot> {
+        panic!("recovery contacted provider")
+    }
+}
+
+struct RecoveryChain {
+    fault: AtomicUsize,
+}
+
+#[async_trait]
+impl Chain for RecoveryChain {
+    async fn tip(&self) -> Result<u32> {
+        Ok(300)
+    }
+    async fn fee(&self) -> Result<u64> {
+        Ok(1)
+    }
+    async fn observe(&self, accept: &SwapAccept) -> Result<Option<Observation>> {
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, Address, Amount, OutPoint, ScriptBuf, TxIn,
+            TxOut,
+        };
+        use std::str::FromStr;
+        let fault = self.fault.load(Ordering::SeqCst);
+        if fault == 7 {
+            return Ok(None);
+        }
+        let mut transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(accept.onchain_amount_sat + 500),
+                script_pubkey: Address::from_str(&accept.htlc_address)
+                    .unwrap()
+                    .require_network(Network::Regtest)
+                    .unwrap()
+                    .script_pubkey(),
+            }],
+        };
+        match fault {
+            3 => transaction.output[0].script_pubkey = ScriptBuf::new(),
+            4 => transaction.output[0].value = Amount::from_sat(accept.onchain_amount_sat - 1),
+            5 => transaction.output[0].value = Amount::from_sat(accept.onchain_amount_sat + 10_001),
+            _ => (),
+        }
+        let mut info = pubky_swap_boltz::chain::info(&transaction);
+        if fault == 1 {
+            info.id = "incorrect-transaction-id".into();
+        }
+        Ok(Some(Observation {
+            transaction: info.clone(),
+            confirmations: 20,
+            outpoint: OutPoint::new(transaction.compute_txid(), if fault == 2 { 1 } else { 0 }),
+            spend: (fault == 6).then_some(info),
+            spend_confirmations: 0,
+        }))
+    }
+    async fn transaction(&self, _: Txid) -> Result<TransactionInfo> {
+        Err(Error::NotFound)
+    }
+    async fn broadcast(&self, _: Transaction) -> Result<Txid> {
+        panic!("inspection broadcast a transaction")
+    }
+}
+
+async fn recovery_record() -> (tempfile::TempDir, pubky_swap_boltz::model::StoredSwap) {
+    recovery_record_for(request(19)).await
+}
+
+async fn recovery_record_for(
+    creation: CreateRequest,
+) -> (tempfile::TempDir, pubky_swap_boltz::model::StoredSwap) {
+    let directory = tempfile::tempdir().unwrap();
+    let bridge = Bridge::new(
+        Arc::new(fixture::FixtureProvider::default()),
+        Arc::new(fixture::FixtureChain),
+        Store::open(directory.path(), "recovery-test").unwrap(),
+        settings(),
+    );
+    let response = bridge.create(creation, None).await.unwrap();
+    let id = Uuid::parse_str(response["id"].as_str().unwrap()).unwrap();
+    drop(bridge);
+    let store = Store::open(directory.path(), "recovery-test").unwrap();
+    let record = store.get(id).unwrap();
+    (directory, record)
+}
+
+#[tokio::test]
+async fn spend_info_is_available_after_timeout_without_a_provider() {
+    let (directory, record) = recovery_record().await;
+    let chain = Arc::new(RecoveryChain {
+        fault: AtomicUsize::new(0),
+    });
+    let bridge = Bridge::new(
+        Arc::new(RecoveryProvider),
+        chain.clone(),
+        Store::open(directory.path(), "recovery-test").unwrap(),
+        settings(),
+    );
+    let info = bridge.spend_info(record.id).await.unwrap();
+    assert_eq!(info.output.value.to_sat(), 100_500);
+    assert_eq!(info.outpoint.vout, 0);
+    assert_eq!(info.confirmations, 20);
+    assert_eq!(info.required_confirmations, 1);
+    assert_eq!(info.tip, 300);
+    assert_eq!(info.timeout_block_height, 244);
+
+    for fault in 1..=5 {
+        chain.fault.store(fault, Ordering::SeqCst);
+        assert!(
+            matches!(bridge.spend_info(record.id).await, Err(Error::Validation)),
+            "fault {fault}"
+        );
+    }
+    chain.fault.store(6, Ordering::SeqCst);
+    assert!(matches!(
+        bridge.spend_info(record.id).await,
+        Err(Error::Invalid(_))
+    ));
+    chain.fault.store(7, Ordering::SeqCst);
+    assert!(matches!(
+        bridge.spend_info(record.id).await,
+        Err(Error::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn spend_info_revalidates_saved_terms_but_allows_expired_hold_invoices() {
+    use bitcoin::{
+        hashes::{sha256, Hash},
+        secp256k1::{Secp256k1, SecretKey},
+    };
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use std::time::Duration;
+
+    let (directory, mut record) = recovery_record().await;
+    let invoice = InvoiceBuilder::new(Currency::Regtest)
+        .amount_milli_satoshis(100_000_000)
+        .description("Expired recovery fixture".into())
+        .payment_hash(sha256::Hash::from_byte_array([19; 32]))
+        .payment_secret(PaymentSecret([7; 32]))
+        .duration_since_epoch(Duration::from_secs(1))
+        .expiry_time(Duration::from_secs(86_400))
+        .min_final_cltv_expiry_delta(240)
+        .build_signed(|message| {
+            Secp256k1::new()
+                .sign_ecdsa_recoverable(message, &SecretKey::from_slice(&[1; 32]).unwrap())
+        })
+        .unwrap();
+    assert!(invoice.is_expired());
+    record.accept.as_mut().unwrap().invoice = Some(invoice.to_string());
+    record.response.as_mut().unwrap()["invoice"] = serde_json::json!(invoice.to_string());
+    for corrupt in [false, true] {
+        let store = Store::open(directory.path(), "recovery-test").unwrap();
+        if corrupt {
+            record.native_request.as_mut().unwrap().payment_hash_hex = hex::encode([20; 32]);
+        }
+        store.save(&record).unwrap();
+        let bridge = Bridge::new(
+            Arc::new(RecoveryProvider),
+            Arc::new(RecoveryChain {
+                fault: AtomicUsize::new(0),
+            }),
+            store,
+            settings(),
+        );
+        let result = bridge.spend_info(record.id).await;
+        if corrupt {
+            assert!(matches!(result, Err(Error::Validation)));
+        } else {
+            assert!(result.is_ok());
+        }
+    }
+}
+
+struct RefundChain {
+    transaction: Transaction,
+    fault: AtomicUsize,
+}
+
+#[async_trait]
+impl Chain for RefundChain {
+    async fn tip(&self) -> Result<u32> {
+        Ok(300)
+    }
+    async fn fee(&self) -> Result<u64> {
+        Ok(1)
+    }
+    async fn observe(&self, _: &SwapAccept) -> Result<Option<Observation>> {
+        panic!("refund must not filter funding by quote amount")
+    }
+    async fn refund_utxos(
+        &self,
+        _: &SwapAccept,
+    ) -> Result<Vec<(bitcoin::OutPoint, bitcoin::TxOut)>> {
+        let mut outputs: Vec<_> = self
+            .transaction
+            .output
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                (
+                    bitcoin::OutPoint::new(self.transaction.compute_txid(), index as u32),
+                    output.clone(),
+                )
+            })
+            .collect();
+        match self.fault.load(Ordering::SeqCst) {
+            1 => outputs.push(outputs[0].clone()),
+            2 => outputs[0].1.value = bitcoin::Amount::from_sat(501),
+            3 => outputs[0].1.script_pubkey = bitcoin::ScriptBuf::new(),
+            4 => outputs[0].0.vout = 999,
+            5 => outputs.clear(),
+            _ => (),
+        }
+        Ok(outputs)
+    }
+    async fn transaction(&self, _: Txid) -> Result<TransactionInfo> {
+        Ok(pubky_swap_boltz::chain::info(&self.transaction))
+    }
+    async fn broadcast(&self, _: Transaction) -> Result<Txid> {
+        panic!("inspection must not broadcast")
+    }
+}
+
+#[tokio::test]
+async fn submarine_refund_recovers_all_funding_amounts_and_checks_each_output() {
+    use bitcoin::{
+        absolute::LockTime,
+        hashes::{sha256, Hash},
+        secp256k1::{Secp256k1, SecretKey},
+        transaction::Version,
+        Address, Amount, TxIn, TxOut,
+    };
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+    use pubky_swap_boltz::model::SubmarineRequest;
+    use std::{str::FromStr, time::Duration};
+    let invoice = InvoiceBuilder::new(Currency::Regtest)
+        .amount_milli_satoshis(100_000_000)
+        .description("Submarine recovery fixture".into())
+        .payment_hash(sha256::Hash::from_byte_array([21; 32]))
+        .payment_secret(PaymentSecret([7; 32]))
+        .current_timestamp()
+        .expiry_time(Duration::from_secs(86_400))
+        .min_final_cltv_expiry_delta(240)
+        .build_signed(|message| {
+            Secp256k1::new()
+                .sign_ecdsa_recoverable(message, &SecretKey::from_slice(&[1; 32]).unwrap())
+        })
+        .unwrap();
+    let creation = CreateRequest::Submarine(SubmarineRequest {
+        from: "BTC".into(),
+        to: "BTC".into(),
+        invoice: invoice.to_string(),
+        refund_public_key: request(21).client_key().to_owned(),
+        pair_hash: String::new(),
+        referral_id: String::new(),
+        error: String::new(),
+    });
+    let (directory, record) = recovery_record_for(creation).await;
+    let script = Address::from_str(&record.accept.as_ref().unwrap().htlc_address)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap()
+        .script_pubkey();
+    let chain = Arc::new(RefundChain {
+        transaction: Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: [500, 100_000, 250_000]
+                .into_iter()
+                .map(|value| TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: script.clone(),
+                })
+                .collect(),
+        },
+        fault: AtomicUsize::new(0),
+    });
+    let bridge = Bridge::new(
+        Arc::new(RecoveryProvider),
+        chain.clone(),
+        Store::open(directory.path(), "recovery-test").unwrap(),
+        settings(),
+    );
+    let info = bridge.refund_info(record.id).await.unwrap();
+    assert_eq!(info.utxos.len(), 3);
+    assert_eq!(
+        info.utxos
+            .iter()
+            .map(|(_, output)| output.value.to_sat())
+            .sum::<u64>(),
+        350_500
+    );
+    assert_eq!(info.tip, 300);
+    assert_eq!(info.timeout_block_height, 244);
+    for fault in 1..=4 {
+        chain.fault.store(fault, Ordering::SeqCst);
+        assert!(
+            matches!(bridge.refund_info(record.id).await, Err(Error::Validation)),
+            "fault {fault}"
+        );
+    }
+    chain.fault.store(5, Ordering::SeqCst);
+    assert!(matches!(
+        bridge.refund_info(record.id).await,
+        Err(Error::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn reverse_contract_is_not_a_client_refund_target() {
+    let (directory, record) = recovery_record().await;
+    let bridge = Bridge::new(
+        Arc::new(RecoveryProvider),
+        Arc::new(fixture::FixtureChain),
+        Store::open(directory.path(), "recovery-test").unwrap(),
+        settings(),
+    );
+    assert!(matches!(
+        bridge.refund_info(record.id).await,
+        Err(Error::Unsupported)
+    ));
+}

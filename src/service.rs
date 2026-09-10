@@ -3,8 +3,10 @@
 use crate::{
     chain::Chain, fees, model::*, provider::Provider, store::Store, validation, Error, Result,
 };
-use bitcoin::Network;
+use bitcoin::{consensus::deserialize, Address, Network, Transaction};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use swap_common::{
     messages::*, timelock::TimelockParams, validate::ClientPolicy, SwapDirection, SwapState,
@@ -297,6 +299,117 @@ impl Bridge {
             }
         }
         Ok(())
+    }
+
+    /// Inspect an accepted lockup using only saved terms and the configured chain service.
+    /// No provider request is made. The caller must enforce its claim or refund safety window
+    /// immediately before signing, and keep private keys and preimages outside the bridge.
+    pub async fn spend_info(&self, id: Uuid) -> Result<SpendInfo> {
+        let record = self.recovery_record(id)?;
+        let accept = record.accept.as_ref().ok_or(Error::NotFound)?;
+        let quote = record.quote.as_ref().ok_or(Error::Validation)?;
+        let observation = self.chain.observe(accept).await?.ok_or(Error::NotFound)?;
+        if observation.spend.is_some() {
+            return Err(Error::Invalid("swap output is already spent"));
+        }
+        let transaction: Transaction =
+            deserialize(&hex::decode(&observation.transaction.hex).map_err(|_| Error::Validation)?)
+                .map_err(|_| Error::Validation)?;
+        let txid = transaction.compute_txid();
+        if txid != observation.outpoint.txid || txid.to_string() != observation.transaction.id {
+            return Err(Error::Validation);
+        }
+        let output = transaction
+            .output
+            .get(observation.outpoint.vout as usize)
+            .ok_or(Error::Validation)?;
+        let script = Address::from_str(&accept.htlc_address)
+            .map_err(|_| Error::Validation)?
+            .require_network(self.network)
+            .map_err(|_| Error::Validation)?
+            .script_pubkey();
+        if output.script_pubkey != script
+            || output.value.to_sat() < accept.onchain_amount_sat
+            || output.value.to_sat() > accept.onchain_amount_sat.saturating_add(10_000)
+        {
+            return Err(Error::Validation);
+        }
+        Ok(SpendInfo {
+            outpoint: observation.outpoint,
+            output: output.clone(),
+            confirmations: observation.confirmations,
+            required_confirmations: self
+                .policy
+                .effective_confirmations(quote.required_confirmations),
+            tip: self.chain.tip().await?,
+            timeout_block_height: accept.timeout_block_height,
+        })
+    }
+
+    /// Find all outputs recoverable by the client's submarine refund key without requiring
+    /// the funding amount to match the quote. The caller enforces timeout before signing.
+    pub async fn refund_info(&self, id: Uuid) -> Result<RefundInfo> {
+        let record = self.recovery_record(id)?;
+        let accept = record.accept.as_ref().ok_or(Error::NotFound)?;
+        if accept.direction != SwapDirection::Submarine {
+            return Err(Error::Unsupported);
+        }
+        let script = Address::from_str(&accept.htlc_address)
+            .map_err(|_| Error::Validation)?
+            .require_network(self.network)
+            .map_err(|_| Error::Validation)?
+            .script_pubkey();
+        let utxos = self.chain.refund_utxos(accept).await?;
+        if utxos.is_empty() {
+            return Err(Error::NotFound);
+        }
+        let mut seen = HashSet::new();
+        let mut transactions = HashMap::new();
+        for (outpoint, output) in &utxos {
+            if !seen.insert(*outpoint) || output.script_pubkey != script {
+                return Err(Error::Validation);
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                transactions.entry(outpoint.txid)
+            {
+                let info = self.chain.transaction(outpoint.txid).await?;
+                let transaction: Transaction =
+                    deserialize(&hex::decode(&info.hex).map_err(|_| Error::Validation)?)
+                        .map_err(|_| Error::Validation)?;
+                if transaction.compute_txid() != outpoint.txid
+                    || info.id != outpoint.txid.to_string()
+                {
+                    return Err(Error::Validation);
+                }
+                entry.insert(transaction);
+            }
+            if transactions
+                .get(&outpoint.txid)
+                .and_then(|transaction| transaction.output.get(outpoint.vout as usize))
+                != Some(output)
+            {
+                return Err(Error::Validation);
+            }
+        }
+        Ok(RefundInfo {
+            utxos,
+            tip: self.chain.tip().await?,
+            timeout_block_height: accept.timeout_block_height,
+        })
+    }
+
+    fn recovery_record(&self, id: Uuid) -> Result<StoredSwap> {
+        let record = self.store.get(id)?;
+        validation::persisted_accept(&record, &self.policy, self.network)?;
+        let accept = record.accept.as_ref().ok_or(Error::NotFound)?;
+        let quote = record.quote.as_ref().ok_or(Error::Validation)?;
+        let expected = native_request(&record, quote, self.provider.identity());
+        if record.native_request.as_ref() != Some(&expected)
+            || record.response.as_ref() != Some(&creation_response(id, accept)?)
+        {
+            return Err(Error::Validation);
+        }
+        Ok(record)
     }
 
     pub async fn swap_transaction(&self, id: Uuid) -> Result<Value> {

@@ -87,3 +87,24 @@ Use `canonical_pubky` before binding persistent state to a provider. It accepts 
 `Bridge::spend_info` reads the accepted contract from durable state and independently observes its unspent funding output, without contacting the provider. It returns the actual output value, outpoint, confirmations, required confirmations, current height, and timeout. The caller retains its signing keys and preimages, checks the claim or refund safety window immediately before signing, and constructs the transaction. Expired invoices do not prevent recovery of an existing lockup. For submarine refunds, `Bridge::refund_info` returns every independently verified unspent output of that exact contract, including underpayments, excess payments, and multiple funding outputs. The caller can sweep them together after timeout.
 
 Android hosts must initialize both networking contexts before requests: `initialize_android_verifier` with the current JNI environment and application context, then `install_android_jni_context` with process-lifetime JVM and application global-reference pointers. Bundle the matching Java helper from `rustls-platform-verifier-android` and preserve `org.rustls.platformverifier.**` through code shrinking. The verifier helper and DNS context are separate requirements.
+
+## Logical local backups
+
+`Bridge::export_snapshot` captures the public contracts, original requests, identity binding,
+and idempotency mappings without a provider request. `StoreSnapshot::to_json` and `from_json`
+use a versioned schema with a 16 MiB limit and at most 10,000 swaps and retry mappings.
+Transaction caches are excluded so witness data and preimages cannot enter the snapshot.
+Signing keys and Pubky secrets are outside this store and remain the host wallet's responsibility.
+
+Use the active bridge to export its configured store. For disconnected identities,
+`Store::snapshot_directory` opens the existing database under its exclusive process lock.
+It refuses an active store and never copies live SQLite files. Bindings use
+`identity|provider|network`, with the host's original network spelling preserved.
+
+Validate the entire host backup first with `StoreSnapshot::validate` and the corresponding
+`Bridge::validate_import_snapshot` or `Store::validate_directory_import` merge preflight.
+Then use `Bridge::import_snapshot` or `Store::import_directory`. Each store merges in one
+SQLite transaction, rejects identity and contract conflicts, and preserves existing local
+progress. New records start with an unobserved status and are refreshed from chain and provider
+state. Active bridge mutations cause an immediate busy error. Atomicity across multiple stores
+or the host wallet database belongs to the host application. These APIs do not upload backups.

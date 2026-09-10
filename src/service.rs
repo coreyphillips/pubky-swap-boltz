@@ -51,6 +51,21 @@ impl Bridge {
         })
     }
 
+    /// Export public contracts without waiting for provider or chain requests.
+    pub fn export_snapshot(&self) -> Result<crate::store::StoreSnapshot> {
+        self.store.export_snapshot()
+    }
+
+    pub fn validate_import_snapshot(&self, snapshot: &crate::store::StoreSnapshot) -> Result<()> {
+        self.store.validate_import(snapshot)
+    }
+
+    /// Refuse concurrent mutation instead of waiting behind an in-flight network request.
+    pub async fn import_snapshot(&self, snapshot: &crate::store::StoreSnapshot) -> Result<()> {
+        let _guard = self.mutation.try_lock().map_err(|_| Error::Busy)?;
+        self.store.import_snapshot(snapshot)
+    }
+
     pub async fn offer(&self) -> Result<SwapOffer> {
         let offer = self.provider.offer().await?;
         validation::offer(&offer, &self.provider.provider_key(), self.network)?;
@@ -456,7 +471,7 @@ fn verified_preimage(
     Ok(swap_common::onchain::extract_preimage(&transaction, &outpoint, &hash).is_some())
 }
 
-fn native_request(record: &StoredSwap, quote: &Quote, identity: String) -> SwapRequest {
+pub(crate) fn native_request(record: &StoredSwap, quote: &Quote, identity: String) -> SwapRequest {
     let (claim, refund, invoice) = match &record.request {
         CreateRequest::Submarine(r) => (
             None,
@@ -477,7 +492,7 @@ fn native_request(record: &StoredSwap, quote: &Quote, identity: String) -> SwapR
     }
 }
 
-fn creation_response(id: Uuid, accept: &SwapAccept) -> Result<Value> {
+pub(crate) fn creation_response(id: Uuid, accept: &SwapAccept) -> Result<Value> {
     let tree = accept.swap_tree.as_ref().ok_or(Error::Validation)?;
     Ok(match accept.direction {
         SwapDirection::Submarine => {

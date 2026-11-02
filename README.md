@@ -78,15 +78,43 @@ MIT.
 
 ## Embedded mobile use
 
-Depend on this crate with `default-features = false` and `features = ["mobile"]` to use the library without the HTTP server or CLI. Build a `PubkyProvider::from_secret_key(secret, provider, timeout)`, `ElectrumChain`, identity-bound `Store`, and `Bridge` in the host application. The host supplies its existing 32-byte Pubky Ed25519 secret and must already have registered that identity with a homeserver. The bridge does not create an account or store that secret.
+Depend on this crate with `default-features = false` and `features = ["mobile"]` to use the library without the HTTP server or CLI. Build a `PubkyProvider::from_secret_key_with_storage(secret, provider, timeout, directory, network)`, `ElectrumChain`, identity-bound `Store`, and `Bridge` in the host application. The host supplies its existing 32-byte Pubky Ed25519 secret and must already have registered that identity with a homeserver. The bridge does not create an account or store that secret.
 
-Provider handles initialize without network access. The first provider request signs in on the inbox runtime, and subsequent failures allow a fresh sign-in. Each request renews the authenticated iroh rendezvous so provider restarts or idle peer eviction do not strand a returning client. Dropping the provider handle releases its inbox after outstanding requests finish or expire.
+Provider handles initialize without network access. Root-key requests reuse an authenticated direct RPC connection and fall back to encrypted DMs using the same request and quote IDs. Session requests reuse their session RPC connection while rechecking authorization. DM authentication is deferred until needed. Queue wait and reconnect attempts consume one request deadline. Cancellation preserves saved creation intent and any outbox publication that may already have started.
 
 Use `canonical_pubky` before binding persistent state to a provider. It accepts a bare z32 identity, `pubkyKEY`, `pubky:KEY`, `pubky://KEY`, or `pk:KEY`, with surrounding whitespace and a trailing slash. Resource paths and unrelated schemes are rejected. `identity_from_secret` derives the public identity without importing SDK-specific key types.
 
 `Bridge::spend_info` reads the accepted contract from durable state and independently observes its unspent funding output, without contacting the provider. It returns the actual output value, outpoint, confirmations, required confirmations, current height, and timeout. The caller retains its signing keys and preimages, checks the claim or refund safety window immediately before signing, and constructs the transaction. Expired invoices do not prevent recovery of an existing lockup. For submarine refunds, `Bridge::refund_info` returns every independently verified unspent output of that exact contract, including underpayments, excess payments, and multiple funding outputs. The caller can sweep them together after timeout.
 
 Android hosts must initialize both networking contexts before requests: `initialize_android_verifier` with the current JNI environment and application context, then `install_android_jni_context` with process-lifetime JVM and application global-reference pointers. Bundle the matching Java helper from `rustls-platform-verifier-android` and preserve `org.rustls.platformverifier.**` through code shrinking. The verifier helper and DNS context are separate requirements.
+
+## Accounts imported through Pubky Ring
+
+`PubkyProvider::from_session_with_storage` accepts the saved Pubky grant credential, account public key,
+application wallet scope, host wallet secret, provider, request timeout, storage directory, and Bitcoin network. It supports the
+Pubky 0.11 grant format used by current Paykit imports. The grant is validated with its
+homeserver on the first request. Construction and unilateral chain recovery remain available
+offline, including when a saved grant has expired.
+
+The wallet secret derives a separate communication key, scoped to the account, provider, and
+application. Bind the local store to `provider.identity()`, which returns that communication
+identity. `PubkyProvider::renew_session` renews the grant in place for the same binding,
+keeping its identity, exclusive journal, RPC endpoint and recovery database. An active session
+validates the replacement before committing it; failure, timeout or cancellation before commit
+retains the previous credentials. Cancellation after commit leaves the renewed provider active.
+A session that has not connected yet remains lazy, preserving offline recovery.
+
+Before each encrypted request, the adapter uses the grant to publish a ten-minute authorization
+under the permitted application wallet namespace. The provider reads and verifies the account,
+application scope, authenticated transport key, provider, and expiry. The grant credential stays
+on the device and is never sent to the swap provider. Status updates are polled over the same
+encrypted request protocol. The public authorization reveals the account's association with
+that communication key and provider, but contains no swap amounts or recovery secrets.
+
+This flow requires a provider with `session-rpc-v1` and iroh rendezvous enabled. Account-level
+limits apply across communication keys. Account root secrets remain in Ring, and claim/refund
+keys remain in the wallet. See the upstream session protocol documentation for revocation and
+expiry behavior.
 
 ## Logical local backups
 
@@ -108,3 +136,15 @@ SQLite transaction, rejects identity and contract conflicts, and preserves exist
 progress. New records start with an unobserved status and are refreshed from chain and provider
 state. Active bridge mutations cause an immediate busy error. Atomicity across multiple stores
 or the host wallet database belongs to the host application. These APIs do not upload backups.
+
+## Durable transport state
+
+The wrapper pins all swap crates to `ca3d5f375da4f1248023a33d7e5c060083e5fc72` and messenger to the upstream lockfile revision `4fff0ce2183f7273c0418801c262ed291a0a145a`. Desktop and mobile features use that same source chain without development patches.
+
+Storage constructors create private `delivery/<scope-hash>/` directories under the supplied store root. The scope binds the transport identity, Bitcoin network, and provider. `inbox.json` retains pending and acknowledged message identities; `outbox.json` retains exact signed resources; `replies.sqlite3` retains creation requests and received outcomes before an inbox receipt is acknowledged. Journal corruption, unsupported formats and competing writers fail visibly. Startup never marks historical messages handled.
+
+`delivery_status()` reports sanitized independent publication and cleanup pause flags. After correcting a persistent authentication or request error, call `retry_delivery(id, operation)` deliberately for that saved resource. Automatic maintenance preserves IDs and encrypted bytes and never silently unpauses failures. Read-only resources expire after ten minutes. Creation resources remain retained conservatively; domain-driven creation cleanup is not yet enabled because every cleanup batch must recheck terminal chain state. No conversation-wide cleanup is used.
+
+Received creation acceptance is saved before validation. `StoredSwap.response` is populated only after contract, invoice, original tip anchor and current execution window validation succeed. Process restart reuses the saved acceptance or original quote and request. Host wallets must record payment submission intent before paying an invoice and must reconcile an ambiguous payment instead of blindly submitting again.
+
+Logical contract snapshots do not yet include the delivery directory. Hosts must report that limitation or reject a backup that would omit pending transport journals. Do not copy active SQLite or JSON journal files as a substitute for an atomic logical export. The volatile constructors are intended only for fixtures or applications explicitly accepting loss of transport state on restart.

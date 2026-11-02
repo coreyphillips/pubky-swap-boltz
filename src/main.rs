@@ -34,16 +34,12 @@ async fn main() -> anyhow::Result<()> {
         &config.recovery_phrase,
         &config.passphrase,
     )?;
-    let transport = if identity.method == "file" {
-        pubky_transport::Transport::from_recovery_file(&identity.value, &identity.passphrase).await
-    } else {
-        pubky_transport::Transport::from_recovery_phrase(
-            &identity.value,
-            Some(&identity.passphrase),
-        )
-        .await
-    }
-    .map_err(|_| anyhow::anyhow!("Pubky sign-in failed"))?;
+    let transport = pubky_transport::Transport::unsigned_from_recovery(
+        identity.method,
+        &identity.value,
+        &identity.passphrase,
+    )
+    .map_err(|_| anyhow::anyhow!("Pubky identity recovery failed"))?;
     let binding = format!(
         "{}|{}|{:?}",
         transport.public_key_string(),
@@ -51,10 +47,12 @@ async fn main() -> anyhow::Result<()> {
         config.network
     );
     let store = Store::open(&config.data_dir, &binding)?;
-    let provider = PubkyProvider::new(
-        Arc::new(transport),
+    let provider = PubkyProvider::new_with_storage(
+        transport,
         config.provider,
         Duration::from_secs(config.request_timeout_seconds),
+        config.data_dir.clone(),
+        config.network.to_bitcoin_network(),
     )
     .await?;
     let chain =

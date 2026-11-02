@@ -41,12 +41,12 @@ futures-util = { version = "0.3", optional = true }
 fs2 = "0.4"
 hex = "0.4"
 lightning-invoice = { version = "0.33", features = ["std"] }
-pubky-transport = { git = "https://github.com/coreyphillips/pubky-swap", rev = "0867de2ce94b8a2932a64372de4cd14aaa70040d" }
+pubky-transport = { git = "https://github.com/coreyphillips/pubky-swap", rev = "ca3d5f375da4f1248023a33d7e5c060083e5fc72" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-swap-common = { git = "https://github.com/coreyphillips/pubky-swap", rev = "0867de2ce94b8a2932a64372de4cd14aaa70040d" }
-swap-config = { git = "https://github.com/coreyphillips/pubky-swap", rev = "0867de2ce94b8a2932a64372de4cd14aaa70040d", optional = true }
+swap-common = { git = "https://github.com/coreyphillips/pubky-swap", rev = "ca3d5f375da4f1248023a33d7e5c060083e5fc72" }
+swap-config = { git = "https://github.com/coreyphillips/pubky-swap", rev = "ca3d5f375da4f1248023a33d7e5c060083e5fc72", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = { version = "0.8", optional = true }
@@ -60,6 +60,7 @@ jni = { version = "0.22.4", default-features = false, optional = true }
 rustls-platform-verifier = { version = "0.7", optional = true }
 
 [dev-dependencies]
+base64 = "0.22"
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

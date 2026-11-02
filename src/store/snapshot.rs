@@ -214,12 +214,16 @@ fn validate_record(entry: &SnapshotSwap, identity: &str, network: Network) -> Re
     )
     .map_err(|_| Error::Validation)?;
     match (&record.accept, &record.response) {
-        (Some(accept), Some(response)) => {
+        (Some(accept), response) => {
             if accept.timeout_block_height >= 500_000_000 {
                 return Err(Error::Validation);
             }
             validation::persisted_accept(record, &policy, network)?;
-            if *response != creation_response(record.id, accept)? {
+            let expected = creation_response(record.id, accept)?;
+            if response
+                .as_ref()
+                .is_some_and(|response| *response != expected)
+            {
                 return Err(Error::Validation);
             }
         }

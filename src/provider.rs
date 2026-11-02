@@ -1,21 +1,34 @@
-//! A dedicated Pubky inbox serializes request/reply exchanges on its own runtime.
+//! A dedicated Pubky inbox reuses connections and persists delivery before acknowledgement.
 
 use crate::{Error, Result};
 use async_trait::async_trait;
+use bitcoin::Network;
 use pubky_transport::Transport;
-use std::{sync::Arc, time::Duration};
+pub use pubky_transport::{DeliveryOperation, OutboxStatus};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use swap_common::messages::*;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot},
     time::{sleep, Instant},
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod delivery;
+#[cfg(test)]
+mod delivery_tests;
+mod inbox;
+#[cfg(feature = "rendezvous")]
+mod session;
+use delivery::DeliveryJournal;
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn identity(&self) -> String;
     fn provider_key(&self) -> String;
+    fn subscribe_delivery(&self) -> Option<broadcast::Receiver<()>> {
+        None
+    }
     async fn offer(&self) -> Result<SwapOffer>;
     async fn quote(&self, request: QuoteRequest) -> Result<Quote>;
     async fn create(&self, request: SwapRequest) -> Result<SwapAccept>;
@@ -29,7 +42,22 @@ pub struct PubkyProvider {
     identity: String,
     provider: String,
     timeout: Duration,
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<WorkerCommand>,
+    transport: Option<Arc<Transport>>,
+    events: broadcast::Sender<()>,
+}
+
+enum WorkerCommand {
+    Request(Box<Command>),
+    #[cfg(feature = "rendezvous")]
+    RenewSession(SessionRenewal),
+}
+
+#[cfg(feature = "rendezvous")]
+struct SessionRenewal {
+    credentials: session::SessionBootstrap,
+    reply: oneshot::Sender<Result<()>>,
+    deadline: Instant,
 }
 
 struct Command {
@@ -48,6 +76,14 @@ enum ReplyKey {
 }
 
 impl ReplyKey {
+    fn id(self) -> String {
+        match self {
+            Self::Offer(id) => format!("offer:{id}"),
+            Self::Quote(id) => format!("quote:{id}"),
+            Self::Accept(id) => format!("accept:{id}"),
+            Self::Snapshot(id) => format!("snapshot:{id}"),
+        }
+    }
     fn matches(self, message: &SwapMessage) -> bool {
         match (self, message) {
             (Self::Offer(id), SwapMessage::Offer(o)) => o.request_id == Some(id),
@@ -76,40 +112,236 @@ pub fn identity_from_secret(secret: &[u8; 32]) -> String {
 enum Bootstrap {
     Existing(Arc<Transport>),
     Secret(Zeroizing<[u8; 32]>),
+    #[cfg(feature = "rendezvous")]
+    Session(session::SessionBootstrap),
 }
 
 impl PubkyProvider {
+    /// Open a volatile provider for callers that manage the supplied transport's journals.
     pub async fn new(
         transport: Arc<Transport>,
         provider: String,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::start(Bootstrap::Existing(transport), provider, timeout).await
+        Self::start(
+            Bootstrap::Existing(transport),
+            provider,
+            timeout,
+            None,
+            Network::Bitcoin,
+        )
+        .await
     }
 
-    /// Open a provider handle for an already registered identity without network access.
-    /// Sign-in is deferred until a request and retried after failures on the inbox runtime.
-    /// With `rendezvous`, the same identity rings the provider before every request.
+    /// Restore scoped delivery state for a caller-owned transport identity.
+    pub async fn new_with_storage(
+        transport: Transport,
+        provider: String,
+        timeout: Duration,
+        directory: PathBuf,
+        network: Network,
+    ) -> Result<Self> {
+        let peer = canonical_pubky(&provider)?;
+        let journal = DeliveryJournal::open(
+            Some(&directory),
+            &transport.public_key_string(),
+            &peer,
+            network,
+        )?;
+        let transport = attach_journals(transport, &journal)?;
+        Self::spawn(
+            Bootstrap::Existing(Arc::new(transport)),
+            peer,
+            timeout,
+            journal,
+        )
+        .await
+    }
+
+    /// Open an identity without network access. Use the storage variant for restart recovery.
     pub async fn from_secret_key(
         secret: [u8; 32],
         provider: String,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::start(Bootstrap::Secret(Zeroizing::new(secret)), provider, timeout).await
+        Self::start(
+            Bootstrap::Secret(Zeroizing::new(secret)),
+            provider,
+            timeout,
+            None,
+            Network::Bitcoin,
+        )
+        .await
     }
 
-    async fn start(bootstrap: Bootstrap, provider: String, timeout: Duration) -> Result<Self> {
+    /// Restore protected journals separated by identity, Bitcoin network and provider.
+    pub async fn from_secret_key_with_storage(
+        secret: [u8; 32],
+        provider: String,
+        timeout: Duration,
+        directory: PathBuf,
+        network: Network,
+    ) -> Result<Self> {
+        Self::start(
+            Bootstrap::Secret(Zeroizing::new(secret)),
+            provider,
+            timeout,
+            Some(directory),
+            network,
+        )
+        .await
+    }
+
+    /// Use a Ring-authorized session without importing the account's private key.
+    #[cfg(feature = "rendezvous")]
+    pub async fn from_session(
+        token: String,
+        owner: String,
+        scope: String,
+        wallet_secret: [u8; 32],
+        provider: String,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let credentials =
+            session::SessionBootstrap::new(token, owner, scope, wallet_secret, &provider)?;
+        Self::start(
+            Bootstrap::Session(credentials),
+            provider,
+            timeout,
+            None,
+            Network::Bitcoin,
+        )
+        .await
+    }
+
+    /// Restore saved session requests and replies in the same account and network scope.
+    #[cfg(feature = "rendezvous")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_session_with_storage(
+        token: String,
+        owner: String,
+        scope: String,
+        wallet_secret: [u8; 32],
+        provider: String,
+        timeout: Duration,
+        directory: PathBuf,
+        network: Network,
+    ) -> Result<Self> {
+        let credentials =
+            session::SessionBootstrap::new(token, owner, scope, wallet_secret, &provider)?;
         let provider = canonical_pubky(&provider)?;
+        let journal = session::open_journal(
+            &directory,
+            &credentials.transport_identity(),
+            &provider,
+            network,
+        )
+        .await?;
+        Self::spawn(Bootstrap::Session(credentials), provider, timeout, journal).await
+    }
+
+    /// Renew the same session binding without interrupting its journal or RPC endpoint.
+    /// Failed or cancelled validation retains the previous credentials. Once acknowledged,
+    /// future requests use the renewed grant; cancellation after commit leaves it active.
+    #[cfg(feature = "rendezvous")]
+    pub async fn renew_session(
+        &self,
+        token: String,
+        owner: String,
+        scope: String,
+        wallet_secret: [u8; 32],
+    ) -> Result<()> {
+        if self.transport.is_some() {
+            return Err(Error::Invalid(
+                "only session providers support grant renewal",
+            ));
+        }
+        let credentials =
+            session::SessionBootstrap::new(token, owner, scope, wallet_secret, &self.provider)?;
+        if credentials.transport_identity() != self.identity {
+            return Err(Error::Conflict);
+        }
+        let (reply, receive) = oneshot::channel();
+        let deadline = Instant::now() + self.timeout;
+        tokio::time::timeout_at(
+            deadline,
+            self.commands
+                .send(WorkerCommand::RenewSession(SessionRenewal {
+                    credentials,
+                    reply,
+                    deadline,
+                })),
+        )
+        .await
+        .map_err(|_| Error::Busy)?
+        .map_err(|_| Error::Provider)?;
+        tokio::time::timeout_at(deadline, receive)
+            .await
+            .map_err(|_| Error::Provider)?
+            .map_err(|_| Error::Provider)?
+    }
+
+    /// Inspect sanitized publication and cleanup failure state without network access.
+    pub fn delivery_status(&self) -> Result<Vec<OutboxStatus>> {
+        self.transport
+            .as_ref()
+            .map(|transport| transport.outbox_status().map_err(|_| Error::Storage))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    /// Deliberately resume one paused operation after its cause has been corrected.
+    pub fn retry_delivery(&self, id: &str, operation: DeliveryOperation) -> Result<()> {
+        self.transport
+            .as_ref()
+            .ok_or(Error::Unsupported)?
+            .retry_outbox(id, operation)
+            .map_err(|_| Error::Storage)?;
+        let _ = self.events.send(());
+        Ok(())
+    }
+
+    async fn start(
+        bootstrap: Bootstrap,
+        provider: String,
+        timeout: Duration,
+        directory: Option<PathBuf>,
+        network: Network,
+    ) -> Result<Self> {
+        let peer = canonical_pubky(&provider)?;
+        let identity = bootstrap_identity(&bootstrap);
+        let journal = DeliveryJournal::open(directory.as_deref(), &identity, &peer, network)?;
+        Self::spawn(bootstrap, peer, timeout, journal).await
+    }
+
+    async fn spawn(
+        bootstrap: Bootstrap,
+        provider: String,
+        timeout: Duration,
+        journal: DeliveryJournal,
+    ) -> Result<Self> {
         if timeout.is_zero() || timeout > Duration::from_secs(300) {
             return Err(Error::Invalid(
                 "request timeout must be positive and at most 300 seconds",
             ));
         }
-        let (commands, receive) = mpsc::channel::<Command>(8);
-        let identity = match &bootstrap {
-            Bootstrap::Existing(transport) => transport.public_key_string(),
-            Bootstrap::Secret(secret) => identity_from_secret(secret),
+        let identity = bootstrap_identity(&bootstrap);
+        let transport = match &bootstrap {
+            Bootstrap::Existing(transport) => Some(transport.clone()),
+            Bootstrap::Secret(secret) => Some(Arc::new(attach_journals(
+                Transport::unsigned(**secret).map_err(|_| Error::Provider)?,
+                &journal,
+            )?)),
+            #[cfg(feature = "rendezvous")]
+            Bootstrap::Session(_) => None,
         };
+        if let Some(transport) = &transport {
+            transport.pin_peer(provider.clone());
+        }
+        let (commands, receive) = mpsc::channel::<WorkerCommand>(8);
+        let events = broadcast::channel(64).0;
+        let worker_events = events.clone();
+        let worker_transport = transport.clone();
         let peer = provider.clone();
         std::thread::Builder::new()
             .name("pubky-inbox".into())
@@ -120,7 +352,14 @@ impl PubkyProvider {
                 else {
                     return;
                 };
-                runtime.block_on(run_inbox(bootstrap, peer, receive));
+                runtime.block_on(inbox::run(
+                    bootstrap,
+                    worker_transport,
+                    peer,
+                    journal,
+                    worker_events,
+                    receive,
+                ));
             })
             .map_err(|_| Error::Provider)?;
         Ok(Self {
@@ -128,23 +367,27 @@ impl PubkyProvider {
             provider,
             timeout,
             commands,
+            transport,
+            events,
         })
     }
 
     async fn request(&self, request: SwapMessage, key: ReplyKey) -> Result<SwapMessage> {
         let (reply, receive) = oneshot::channel();
         let deadline = Instant::now() + self.timeout;
-        self.commands
-            .try_send(Command {
+        // Waiting for a queue slot consumes the same deadline and preserves the caller's request.
+        tokio::time::timeout_at(
+            deadline,
+            self.commands.send(WorkerCommand::Request(Box::new(Command {
                 request,
                 key,
                 reply,
                 deadline,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => Error::Busy,
-                mpsc::error::TrySendError::Closed(_) => Error::Provider,
-            })?;
+            }))),
+        )
+        .await
+        .map_err(|_| Error::Busy)?
+        .map_err(|_| Error::Provider)?;
         tokio::time::timeout_at(deadline, receive)
             .await
             .map_err(|_| Error::Provider)?
@@ -169,107 +412,43 @@ impl PubkyProvider {
     }
 }
 
-async fn initialize_transport(bootstrap: &Bootstrap, peer: &str) -> Result<Arc<Transport>> {
-    let transport = match bootstrap {
-        Bootstrap::Existing(transport) => transport.clone(),
-        Bootstrap::Secret(secret) => Arc::new(
-            Transport::from_secret_key(**secret)
-                .await
-                .map_err(|_| Error::Provider)?,
-        ),
+fn bootstrap_identity(bootstrap: &Bootstrap) -> String {
+    match bootstrap {
+        Bootstrap::Existing(transport) => transport.public_key_string(),
+        Bootstrap::Secret(secret) => identity_from_secret(secret),
+        #[cfg(feature = "rendezvous")]
+        Bootstrap::Session(credentials) => credentials.transport_identity(),
+    }
+}
+
+fn attach_journals(transport: Transport, journal: &DeliveryJournal) -> Result<Transport> {
+    let Some(directory) = &journal.directory else {
+        return Ok(transport);
     };
-    transport.pin_peer(peer.to_owned());
     transport
-        .mark_conversation_seen(peer)
-        .await
-        .map_err(|_| Error::Provider)?;
-    Ok(transport)
+        .with_receive_journal(directory.join("inbox.json"))
+        .and_then(|transport| transport.with_outbox(directory.join("outbox.json")))
+        .map_err(|_| Error::Storage)
 }
 
-async fn run_inbox(bootstrap: Bootstrap, peer: String, mut receive: mpsc::Receiver<Command>) {
-    let mut transport = None;
-    while let Some(mut command) = receive.recv().await {
-        if command.reply.is_closed() || Instant::now() >= command.deadline {
-            continue;
-        }
-        let operation = async {
-            if transport.is_none() {
-                transport = Some(initialize_transport(&bootstrap, &peer).await?);
-            }
-            let secret = match &bootstrap {
-                Bootstrap::Secret(secret) => Some(&**secret),
-                Bootstrap::Existing(_) => None,
-            };
-            exchange(
-                transport.as_ref().ok_or(Error::Provider)?,
-                &peer,
-                secret,
-                command.deadline,
-                &command.request,
-                command.key,
-            )
-            .await
-        };
-        let result = tokio::select! {
-            _ = command.reply.closed() => continue,
-            result = tokio::time::timeout_at(command.deadline, operation) => {
-                result.unwrap_or(Err(Error::Provider))
-            },
-        };
-        if matches!(result, Err(Error::Provider)) {
-            transport = None;
-        }
-        let _ = command.reply.send(result);
+fn validate_reply(reply: SwapMessage, key: ReplyKey) -> Result<SwapMessage> {
+    if !key.matches(&reply) {
+        return Err(Error::Validation);
     }
-}
-
-async fn exchange(
-    transport: &Transport,
-    peer: &str,
-    secret: Option<&[u8; 32]>,
-    deadline: Instant,
-    request: &SwapMessage,
-    key: ReplyKey,
-) -> Result<SwapMessage> {
-    #[cfg(feature = "rendezvous")]
-    if let Some(secret) = secret {
-        tokio::time::timeout_at(deadline, pubky_transport::p2p::ring_provider(*secret, peer))
-            .await
-            .map_err(|_| Error::Provider)?
-            .map_err(|_| Error::Provider)?;
-    }
-    #[cfg(not(feature = "rendezvous"))]
-    let _ = secret;
-    tokio::time::timeout_at(deadline, transport.send(peer, request))
-        .await
-        .map_err(|_| Error::Provider)?
-        .map_err(|_| Error::Provider)?;
-    loop {
-        let received =
-            tokio::time::timeout_at(deadline, transport.receive_from::<SwapMessage>(peer))
-                .await
-                .map_err(|_| Error::Provider)?
-                .map_err(|_| Error::Provider)?;
-        if let Some(reply) = received.into_iter().find(|message| key.matches(message)) {
-            if let SwapMessage::Reject(ref rejection) = reply {
-                if matches!(key, ReplyKey::Snapshot(_))
-                    && rejection.code.as_deref() == Some("not_found")
-                {
-                    return Err(Error::NotFound);
-                }
-                return Err(Error::Provider);
-            }
-            return Ok(reply);
+    if let SwapMessage::Reject(rejection) = &reply {
+        if matches!(key, ReplyKey::Snapshot(_)) && rejection.code.as_deref() == Some("not_found") {
+            return Err(Error::NotFound);
         }
-        if Instant::now() >= deadline {
-            return Err(Error::Provider);
-        }
-        sleep(Duration::from_millis(500)).await;
+        return Err(Error::Provider);
     }
+    Ok(reply)
 }
 
 #[async_trait]
 impl Provider for PubkyProvider {
+    fn subscribe_delivery(&self) -> Option<broadcast::Receiver<()>> {
+        Some(self.events.subscribe())
+    }
     fn identity(&self) -> String {
         self.identity.clone()
     }

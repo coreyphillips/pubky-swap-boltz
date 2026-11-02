@@ -193,7 +193,7 @@ fn decode(body: &str) -> Result<StoredSwap> {
     serde_json::from_str(body).map_err(|_| Error::Storage)
 }
 
-fn private_directory(path: &Path) -> Result<()> {
+pub(crate) fn private_directory(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).map_err(|_| Error::Storage)?;
     #[cfg(unix)]
     {
@@ -204,7 +204,7 @@ fn private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn private_file(path: &Path) -> Result<File> {
+pub(crate) fn private_file(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]

@@ -125,6 +125,15 @@ impl Bridge {
         let _guard = self.mutation.try_lock().map_err(|_| Error::Busy)?;
         let hash = validation::request(&mut request, self.network)?;
         let exists = self.store.find_request(&request)?.is_some();
+        if !exists
+            && self
+                .store
+                .all()?
+                .iter()
+                .any(|record| record.native_request.is_some() && record.response.is_none())
+        {
+            return Err(Error::Busy);
+        }
         let quote = if exists {
             None
         } else {
@@ -202,13 +211,20 @@ impl Bridge {
             record.admission_tip = Some(self.chain.tip().await?);
             self.store.save(record)?;
         }
-        let accept = match self.provider.create(request.clone()).await {
-            Ok(accept)=>accept,
-            Err(error)=>match self.provider.snapshot_by_quote(request.quote_id).await {
-                Ok(snapshot)=>snapshot.accept,
-                Err(Error::NotFound)=>return Err(Error::Invalid("provider has no durable admission for this quote; use a new invoice or payment hash")),
-                Err(_)=>return Err(error),
-            },
+        let accept = if let Some(accept) = &record.accept {
+            accept.clone()
+        } else {
+            let accept = match self.provider.create(request.clone()).await {
+                Ok(accept) => accept,
+                Err(error) => match self.provider.snapshot_by_quote(request.quote_id).await {
+                    Ok(snapshot) => snapshot.accept,
+                    Err(Error::NotFound) => return Err(Error::Invalid("provider has no durable admission for this quote; retry the saved request before creating another swap")),
+                    Err(_) => return Err(error),
+                },
+            };
+            record.accept = Some(accept.clone());
+            self.store.save(record)?;
+            accept
         };
         let tip = self.chain.tip().await?;
         validation::accept(record, &accept, tip, &self.policy, self.network)?;
@@ -223,6 +239,9 @@ impl Bridge {
     pub async fn refresh(&self, id: Uuid) -> Result<SwapUpdate> {
         let _guard = self.mutation.lock().await;
         let mut record = self.store.get(id)?;
+        if record.response.is_none() {
+            return Err(Error::NotFound);
+        }
         let accept = record.accept.as_ref().ok_or(Error::NotFound)?;
         let snapshot = self.provider.snapshot(accept.swap_id).await?;
         if snapshot.accept != *accept

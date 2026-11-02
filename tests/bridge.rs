@@ -736,3 +736,164 @@ async fn reverse_contract_is_not_a_client_refund_target() {
         Err(Error::Unsupported)
     ));
 }
+
+#[tokio::test]
+async fn acceptance_saved_before_validation_survives_restart_without_readmission() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = Arc::new(FaultProvider::default());
+    let chain = Arc::new(ObservedChain {
+        confirmations: AtomicUsize::new(0),
+        tip: AtomicUsize::new(300),
+        spent: AtomicBool::new(false),
+    });
+    let bridge = Bridge::new(
+        provider.clone(),
+        chain.clone(),
+        Store::open(directory.path(), "binding").unwrap(),
+        settings(),
+    );
+    assert!(matches!(
+        bridge.create(request(30), None).await,
+        Err(Error::Validation)
+    ));
+    drop(bridge);
+    let store = Store::open(directory.path(), "binding").unwrap();
+    let record = store.all().unwrap().remove(0);
+    assert!(record.accept.is_some());
+    assert!(record.response.is_none());
+    let quote = record.native_request.as_ref().unwrap().quote_id;
+    chain.tip.store(100, Ordering::SeqCst);
+    // The original anchor remains 300, so this intentionally invalid acceptance stays unready.
+    let bridge = Bridge::new(provider.clone(), chain, store, settings());
+    assert!(matches!(
+        bridge.refresh(record.id).await,
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        bridge.swap_transaction(record.id).await,
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        bridge.create(request(30), None).await,
+        Err(Error::Validation)
+    ));
+    assert_eq!(provider.creates.load(Ordering::SeqCst), 1);
+    assert_eq!(record.accept.as_ref().unwrap().quote_id, quote);
+    assert!(matches!(
+        bridge.create(request(31), None).await,
+        Err(Error::Busy)
+    ));
+}
+
+#[derive(Default)]
+struct StatusRecoveryProvider {
+    inner: FaultProvider,
+}
+
+#[async_trait]
+impl Provider for StatusRecoveryProvider {
+    fn identity(&self) -> String {
+        self.inner.identity()
+    }
+    fn provider_key(&self) -> String {
+        self.inner.provider_key()
+    }
+    async fn offer(&self) -> Result<SwapOffer> {
+        self.inner.offer().await
+    }
+    async fn quote(&self, request: QuoteRequest) -> Result<Quote> {
+        self.inner.quote(request).await
+    }
+    async fn create(&self, request: SwapRequest) -> Result<SwapAccept> {
+        self.inner.create(request).await
+    }
+    async fn snapshot(&self, id: Uuid) -> Result<SwapStatusSnapshot> {
+        self.inner.snapshot(id).await
+    }
+    async fn snapshot_by_quote(&self, id: Uuid) -> Result<SwapStatusSnapshot> {
+        self.inner.inner.snapshot_by_quote(id).await
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_acceptance_recovers_from_status_without_second_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = Arc::new(StatusRecoveryProvider::default());
+    provider.inner.lose_response.store(true, Ordering::SeqCst);
+    let bridge = Bridge::new(
+        provider.clone(),
+        Arc::new(fixture::FixtureChain),
+        Store::open(directory.path(), "binding").unwrap(),
+        settings(),
+    );
+    let response = bridge.create(request(32), None).await.unwrap();
+    drop(bridge);
+    let bridge = Bridge::new(
+        provider.clone(),
+        Arc::new(fixture::FixtureChain),
+        Store::open(directory.path(), "binding").unwrap(),
+        settings(),
+    );
+    assert_eq!(response, bridge.create(request(32), None).await.unwrap());
+    assert_eq!(provider.inner.creates.load(Ordering::SeqCst), 1);
+    let second = bridge.create(request(33), None).await.unwrap();
+    assert_ne!(response["id"], second["id"]);
+    assert_eq!(provider.inner.creates.load(Ordering::SeqCst), 2);
+}
+
+struct InterruptedValidationChain {
+    calls: AtomicUsize,
+    offline: AtomicBool,
+}
+
+#[async_trait]
+impl Chain for InterruptedValidationChain {
+    async fn tip(&self) -> Result<u32> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) > 0 && self.offline.load(Ordering::SeqCst) {
+            return Err(Error::Chain);
+        }
+        Ok(100)
+    }
+    async fn fee(&self) -> Result<u64> {
+        Ok(1)
+    }
+    async fn observe(&self, accept: &SwapAccept) -> Result<Option<Observation>> {
+        fixture::FixtureChain.observe(accept).await
+    }
+    async fn transaction(&self, txid: Txid) -> Result<TransactionInfo> {
+        fixture::FixtureChain.transaction(txid).await
+    }
+    async fn broadcast(&self, transaction: Transaction) -> Result<Txid> {
+        fixture::FixtureChain.broadcast(transaction).await
+    }
+}
+
+#[tokio::test]
+async fn restart_validates_saved_acceptance_after_chain_service_recovers() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = Arc::new(FaultProvider::default());
+    let chain = Arc::new(InterruptedValidationChain {
+        calls: AtomicUsize::new(0),
+        offline: AtomicBool::new(true),
+    });
+    let bridge = Bridge::new(
+        provider.clone(),
+        chain.clone(),
+        Store::open(directory.path(), "binding").unwrap(),
+        settings(),
+    );
+    assert!(matches!(
+        bridge.create(request(34), None).await,
+        Err(Error::Chain)
+    ));
+    drop(bridge);
+    let store = Store::open(directory.path(), "binding").unwrap();
+    let record = store.all().unwrap().remove(0);
+    assert!(record.response.is_none());
+    let accept = record.accept.clone().unwrap();
+    chain.offline.store(false, Ordering::SeqCst);
+    let bridge = Bridge::new(provider.clone(), chain, store, settings());
+    let response = bridge.create(request(34), None).await.unwrap();
+    assert_eq!(response["lockupAddress"], accept.htlc_address);
+    assert_eq!(provider.creates.load(Ordering::SeqCst), 1);
+}
